@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
@@ -34,6 +35,33 @@ import (
 	"tailscale.com/util/testenv"
 )
 
+// DERPCarrier is a region connection. Implementations must support concurrent
+// reads, writes and Close, and must have comparable dynamic values (typically pointers).
+// Close must unblock all operations. RecvDetail identifies reconnect generations.
+// Receive errors implementing Fatal() bool with a true result stop reader retries;
+// the carrier must latch identity, authorization and protocol failures itself.
+type DERPCarrier interface {
+	Connect(context.Context) error
+	Close() error
+	Send(key.NodePublic, []byte) error
+	RecvDetail() (derp.ReceivedMessage, int, error)
+	NotePreferred(bool)
+	SendPong([8]byte) error
+	LocalAddr() (netip.AddrPort, error)
+	Ping(context.Context) error
+}
+
+// DERPControlSender separates reliable discovery/bootstrap from packet datagrams.
+// Carriers with unreliable Send semantics must implement this interface.
+type DERPControlSender interface {
+	SendControl(key.NodePublic, []byte) error
+}
+
+// DERPCarrierFactory constructs a lazy, non-blocking region connection. The region
+// callback must not acquire Conn locks. The factory must return a non-nil carrier.
+// A configured factory replaces native DERP.
+type DERPCarrierFactory func(key.NodePrivate, func() *tailcfg.DERPRegion) DERPCarrier
+
 // frameReceiveRecordRate is the minimum time between updates to last frame
 // received times.
 // Note: this is relevant to other parts of the system, such as netcheck
@@ -46,11 +74,11 @@ const frameReceiveRecordRate = 5 * time.Second
 // used to write directly; it's owned by the read/write loops)
 type derpRoute struct {
 	regionID tailcfg.DERPRegionID
-	dc       *derphttp.Client // don't use directly; see comment above
+	dc       DERPCarrier // don't use directly; see comment above
 }
 
 // removeDerpPeerRoute removes a DERP route entry previously added by addDerpPeerRoute.
-func (c *Conn) removeDerpPeerRoute(peer key.NodePublic, regionID tailcfg.DERPRegionID, dc *derphttp.Client) {
+func (c *Conn) removeDerpPeerRoute(peer key.NodePublic, regionID tailcfg.DERPRegionID, dc DERPCarrier) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r2 := derpRoute{regionID, dc}
@@ -62,7 +90,7 @@ func (c *Conn) removeDerpPeerRoute(peer key.NodePublic, regionID tailcfg.DERPReg
 // addDerpPeerRoute adds a DERP route entry, noting that peer was seen
 // on DERP node derpID, at least on the connection identified by dc.
 // See issue 150 for details.
-func (c *Conn) addDerpPeerRoute(peer key.NodePublic, regionID tailcfg.DERPRegionID, dc *derphttp.Client) {
+func (c *Conn) addDerpPeerRoute(peer key.NodePublic, regionID tailcfg.DERPRegionID, dc DERPCarrier) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	mak.Set(&c.derpRoute, peer, derpRoute{regionID, dc})
@@ -90,9 +118,12 @@ func (c *Conn) fallbackDERPRegionForPeer(peer key.NodePublic) (regionID tailcfg.
 
 // activeDerp contains fields for an active DERP connection.
 type activeDerp struct {
-	c       *derphttp.Client
-	cancel  context.CancelFunc
-	writeCh chan derpWriteRequest
+	// terminalErr preserves fatal authority failure after the reader closes c.
+	// Protected by Conn.mu; a replacement carrier starts without this fence.
+	terminalErr error
+	c           DERPCarrier
+	cancel      context.CancelFunc
+	writeCh     chan derpWriteRequest
 	// lastWrite is the time of the last request for its write
 	// channel (currently even if there was no write).
 	// It is always non-nil and initialized to a non-zero Time.
@@ -396,7 +427,7 @@ func (c *Conn) derpWriteChanForRegion(regionID tailcfg.DERPRegionID, peer key.No
 
 	// Note that derphttp.NewRegionClient does not dial the server
 	// (it doesn't block) so it is safe to do under the c.mu lock.
-	dc := derphttp.NewRegionClient(c.privateKey, c.logf, c.netMon, func() *tailcfg.DERPRegion {
+	region := func() *tailcfg.DERPRegion {
 		// Warning: it is not legal to acquire
 		// magicsock.Conn.mu from this callback.
 		// It's run from derphttp.Client.connect (via Send, etc)
@@ -412,17 +443,23 @@ func (c *Conn) derpWriteChanForRegion(regionID tailcfg.DERPRegionID, peer key.No
 			return nil
 		}
 		return derpMap.Regions[regionID]
-	})
-	dc.HealthTracker = c.health
-	dc.AppName = c.derpAppName
-	if c.extraRootCAs != nil {
-		dc.TLSConfig = &tls.Config{RootCAs: c.extraRootCAs}
 	}
-
-	dc.SetCanAckPings(true)
+	var dc DERPCarrier
+	if c.derpCarrierFactory != nil {
+		dc = c.derpCarrierFactory(c.privateKey, region)
+	} else {
+		native := derphttp.NewRegionClient(c.privateKey, c.logf, c.netMon, region)
+		native.HealthTracker = c.health
+		native.AppName = c.derpAppName
+		if c.extraRootCAs != nil {
+			native.TLSConfig = &tls.Config{RootCAs: c.extraRootCAs}
+		}
+		native.SetCanAckPings(true)
+		native.SetAddressFamilySelector(derpAddrFamSelector{c})
+		native.DNSCache = dnscache.Get()
+		dc = native
+	}
 	dc.NotePreferred(c.myDerp == regionID)
-	dc.SetAddressFamilySelector(derpAddrFamSelector{c})
-	dc.DNSCache = dnscache.Get()
 
 	ctx, cancel := context.WithCancel(c.connCtx)
 	ch := make(chan derpWriteRequest, derpWriteQueueDepth)
@@ -530,7 +567,7 @@ type derpReadResult struct {
 
 // runDerpReader runs in a goroutine for the life of a DERP
 // connection, handling received packets.
-func (c *Conn) runDerpReader(ctx context.Context, regionID tailcfg.DERPRegionID, dc *derphttp.Client, wg *syncs.WaitGroupChan, startGate <-chan struct{}) {
+func (c *Conn) runDerpReader(ctx context.Context, regionID tailcfg.DERPRegionID, dc DERPCarrier, wg *syncs.WaitGroupChan, startGate <-chan struct{}) {
 	defer wg.Decr()
 	defer dc.Close()
 
@@ -568,7 +605,12 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID tailcfg.DERPRegionID,
 				delete(peerPresent, peer)
 				c.removeDerpPeerRoute(peer, regionID, dc)
 			}
-			if err == derphttp.ErrClientClosed {
+			var fatal interface{ Fatal() bool }
+			if errors.As(err, &fatal) && fatal.Fatal() {
+				c.recordDERPTerminalError(regionID, dc, err)
+				return
+			}
+			if errors.Is(err, derphttp.ErrClientClosed) {
 				return
 			}
 			if c.networkDown() {
@@ -614,9 +656,6 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID tailcfg.DERPRegionID,
 			pkt = m
 			res.n = len(m.Data)
 			res.src = m.Source
-			if logDerpVerbose() {
-				c.logf("magicsock: got derp-%v packet: %q", regionID, m.Data)
-			}
 			// If this is a new sender we hadn't seen before, remember it and
 			// register a route for this peer.
 			if res.src != lastPacketSrc { // avoid map lookup w/ high throughput single peer
@@ -680,7 +719,7 @@ type derpWriteRequest struct {
 
 // runDerpWriter runs in a goroutine for the life of a DERP
 // connection, handling received packets.
-func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan derpWriteRequest, wg *syncs.WaitGroupChan, startGate <-chan struct{}) {
+func (c *Conn) runDerpWriter(ctx context.Context, dc DERPCarrier, ch <-chan derpWriteRequest, wg *syncs.WaitGroupChan, startGate <-chan struct{}) {
 	defer wg.Decr()
 	select {
 	case <-startGate:
@@ -693,7 +732,12 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
 		case <-ctx.Done():
 			return
 		case wr := <-ch:
-			err := dc.Send(wr.pubKey, wr.b)
+			var err error
+			if control, ok := dc.(DERPControlSender); wr.isDisco && ok {
+				err = control.SendControl(wr.pubKey, wr.b)
+			} else {
+				err = dc.Send(wr.pubKey, wr.b)
+			}
 			if err != nil {
 				c.logf("magicsock: derp.Send(%v): %v", wr.addr, err)
 				metricSendDERPError.Add(1)
@@ -777,12 +821,68 @@ func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep *en
 }
 
 // SendDERPPacketTo sends an arbitrary packet to the given node key via
-// the DERP relay for the given region. It creates the DERP connection
+// the DERP relay for the given region as reliable control when supported.
+// It creates the DERP connection
 // to the region if one doesn't already exist.
 func (c *Conn) SendDERPPacketTo(dstKey key.NodePublic, regionID tailcfg.DERPRegionID, pkt []byte) (sent bool, err error) {
 	return c.sendAddr(
 		netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(regionID)),
-		dstKey, pkt, false, false)
+		dstKey, pkt, true, false)
+}
+
+// recordDERPTerminalError fences only the carrier whose reader failed. A late
+// old reader must never invalidate a replacement installed for fresh authority.
+func (c *Conn) recordDERPTerminalError(regionID tailcfg.DERPRegionID, carrier DERPCarrier, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if active, ok := c.activeDerp[regionID]; ok && active.c == carrier {
+		active.terminalErr = err
+		c.activeDerp[regionID] = active
+	}
+}
+
+// PrepareDERP connects and pings the carrier owned by this Conn for regionID.
+func (c *Conn) PrepareDERP(ctx context.Context, regionID tailcfg.DERPRegionID) error {
+	if c.derpWriteChanForRegion(regionID, key.NodePublic{}) == nil {
+		return fmt.Errorf("magicsock: DERP region %d is unavailable", regionID)
+	}
+	c.mu.Lock()
+	ad, ok := c.activeDerp[regionID]
+	c.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("magicsock: DERP region %d is unavailable", regionID)
+	}
+	if ad.terminalErr != nil {
+		return fmt.Errorf("magicsock: DERP region %d authority: %w", regionID, ad.terminalErr)
+	}
+	if err := ad.c.Connect(ctx); err != nil {
+		return fmt.Errorf("magicsock: connect DERP region %d: %w", regionID, err)
+	}
+	if err := ad.c.Ping(ctx); err != nil {
+		return fmt.Errorf("magicsock: ping DERP region %d: %w", regionID, err)
+	}
+	return nil
+}
+
+// SendDERPPacketToRegion sends through an already prepared carrier for exactly
+// regionID. It never substitutes a reverse route through another region.
+func (c *Conn) SendDERPPacketToRegion(dstKey key.NodePublic, regionID tailcfg.DERPRegionID, pkt []byte) error {
+	c.mu.Lock()
+	ad, ok := c.activeDerp[regionID]
+	if ok {
+		*ad.lastWrite = time.Now()
+	}
+	c.mu.Unlock()
+	if !ok {
+		return fmt.Errorf("magicsock: DERP region %d is not prepared", regionID)
+	}
+	req := derpWriteRequest{addr: netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(regionID)), pubKey: dstKey, b: append([]byte(nil), pkt...), isDisco: true}
+	select {
+	case ad.writeCh <- req:
+		return nil
+	default:
+		return errors.New("magicsock: DERP write queue is full")
+	}
 }
 
 // SetOnlyTCP443 set whether the magicsock connection is restricted
@@ -909,14 +1009,19 @@ func (c *Conn) maybeCloseDERPsOnRebind(okayLocalIPs []netip.Prefix) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for regionID, ad := range c.activeDerp {
-		la, err := ad.c.LocalAddr()
-		if err != nil {
-			c.closeOrReconnectDERPLocked(regionID, "rebind-no-localaddr")
-			continue
-		}
-		if !tsaddr.PrefixesContainsIP(okayLocalIPs, la.Addr()) {
-			c.closeOrReconnectDERPLocked(regionID, "rebind-default-route-change")
-			continue
+		// Injected carriers own their sockets (including QUIC migration and
+		// proxy TCP). Their local address may be unspecified or unavailable;
+		// verify liveness instead of treating it as the magicsock UDP binding.
+		if c.derpCarrierFactory == nil {
+			la, err := ad.c.LocalAddr()
+			if err != nil {
+				c.closeOrReconnectDERPLocked(regionID, "rebind-no-localaddr")
+				continue
+			}
+			if !tsaddr.PrefixesContainsIP(okayLocalIPs, la.Addr()) {
+				c.closeOrReconnectDERPLocked(regionID, "rebind-default-route-change")
+				continue
+			}
 		}
 		dc := ad.c
 		go func() {
@@ -925,7 +1030,9 @@ func (c *Conn) maybeCloseDERPsOnRebind(okayLocalIPs []netip.Prefix) {
 			if err := dc.Ping(ctx); err != nil {
 				c.mu.Lock()
 				defer c.mu.Unlock()
-				c.closeOrReconnectDERPLocked(regionID, "rebind-ping-fail")
+				if current, ok := c.activeDerp[regionID]; ok && current.c == dc {
+					c.closeOrReconnectDERPLocked(regionID, "rebind-ping-fail")
+				}
 				return
 			}
 			c.logf("post-rebind ping of DERP region %d okay", regionID)
