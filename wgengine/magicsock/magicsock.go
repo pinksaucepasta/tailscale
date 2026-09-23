@@ -172,7 +172,8 @@ type Conn struct {
 	health                 *health.Tracker                                         // or nil
 	extraRootCAs           *x509.CertPool                                          // additional trusted root CAs; or nil
 	controlKnobs           *controlknobs.Knobs                                     // or nil
-	derpAppName            string                                                  // or empty, see Options.DERPAppName
+	derpCarrierFactory     DERPCarrierFactory
+	derpAppName            string // or empty, see Options.DERPAppName
 
 	// ================================================================
 	// No locking required to access these fields, either because
@@ -495,6 +496,9 @@ type Options struct {
 	// advertise to DERP servers for stats purposes.
 	DERPAppName string
 
+	// DERPCarrierFactory replaces the default DERP connection when set.
+	DERPCarrierFactory DERPCarrierFactory
+
 	// Metrics specifies the metrics registry to record metrics to.
 	Metrics *usermetric.Registry
 
@@ -711,6 +715,7 @@ func NewConn(opts Options) (*Conn, error) {
 	c.health = opts.HealthTracker
 	c.extraRootCAs = opts.ExtraRootCAs
 	c.derpAppName = opts.DERPAppName
+	c.derpCarrierFactory = opts.DERPCarrierFactory
 	c.getPeerByKey = opts.PeerByKeyFunc
 
 	if err := c.rebind(keepCurrentPort); err != nil {

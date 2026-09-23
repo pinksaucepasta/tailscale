@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -66,6 +67,8 @@ const (
 
 // Server implements an experimental UDP relay server.
 type Server struct {
+	endpointAuthorizer atomic.Pointer[func(key.DiscoPublic, key.DiscoPublic) bool]
+	forwardingLimiter  atomic.Pointer[func(key.DiscoPublic, key.DiscoPublic) bool]
 	// The following fields are initialized once and never mutated.
 	logf                logger.Logf
 	disco               key.DiscoPrivate
@@ -124,6 +127,7 @@ type serverEndpoint struct {
 	allocatedAt        mono.Time
 
 	mu                   sync.Mutex        // guards the following fields
+	policyDeadline       mono.Time         // zero for upstream allocations; absolute authorization deadline
 	closed               bool              // signals that no new data should be accepted
 	inProgressGeneration [2]uint32         // or zero if a handshake has never started, or has just completed
 	boundAddrPorts       [2]netip.AddrPort // or zero value if a handshake has never completed for that relay leg
@@ -159,7 +163,7 @@ func (e *serverEndpoint) handleDiscoControlMsg(from netip.AddrPort, senderIndex 
 	defer e.mu.Unlock()
 	lastState := e.stateLocked()
 
-	if lastState == endpointClosed {
+	if lastState == endpointClosed || (!e.policyDeadline.IsZero() && now >= e.policyDeadline) {
 		// endpoint was closed in [Server.endpointGC]
 		return nil, netip.AddrPort{}
 	}
@@ -290,6 +294,9 @@ func (e *serverEndpoint) handleSealedDiscoControlMsg(from netip.AddrPort, b []by
 func (e *serverEndpoint) handleDataPacket(from netip.AddrPort, b []byte, now mono.Time) (write []byte, to netip.AddrPort) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if !e.policyDeadline.IsZero() && (now >= e.policyDeadline || len(b) > 2048+packet.GeneveFixedHeaderLength) {
+		return nil, netip.AddrPort{}
+	}
 	if !e.isBoundLocked() {
 		// not a control packet, but serverEndpoint isn't bound
 		return nil, netip.AddrPort{}
@@ -330,6 +337,9 @@ func (e *serverEndpoint) maybeExpire(now mono.Time, bindLifetime, steadyStateLif
 }
 
 func (e *serverEndpoint) isExpiredLocked(now mono.Time, bindLifetime, steadyStateLifetime time.Duration) bool {
+	if e.closed || (!e.policyDeadline.IsZero() && now >= e.policyDeadline) {
+		return true
+	}
 	if !e.isBoundLocked() {
 		if now.Sub(e.allocatedAt) > bindLifetime {
 			return true
@@ -818,6 +828,19 @@ func (s *Server) handlePacket(from netip.AddrPort, b []byte) (write []byte, to n
 		return nil, netip.AddrPort{}, false
 	}
 
+	ep := e.(*serverEndpoint)
+	ep.mu.Lock()
+	policyInvalid := !ep.policyDeadline.IsZero() && (mono.Now() >= ep.policyDeadline || len(b) > 2048+packet.GeneveFixedHeaderLength)
+	ep.mu.Unlock()
+	if policyInvalid {
+		return nil, netip.AddrPort{}, false
+	}
+	if authorize := s.endpointAuthorizer.Load(); authorize != nil {
+		pair := e.(*serverEndpoint).discoPubKeys.Get()
+		if !(*authorize)(pair[0], pair[1]) {
+			return nil, netip.AddrPort{}, false
+		}
+	}
 	now := mono.Now()
 	if gh.Control {
 		if gh.Protocol != packet.GeneveProtocolDisco {
@@ -831,6 +854,14 @@ func (s *Server) handlePacket(from netip.AddrPort, b []byte) (write []byte, to n
 		return
 	}
 	write, to = e.(*serverEndpoint).handleDataPacket(from, b, now)
+	if len(write) > 0 && to.IsValid() {
+		if limit := s.forwardingLimiter.Load(); limit != nil {
+			pair := ep.discoPubKeys.Get()
+			if !(*limit)(pair[0], pair[1]) {
+				return nil, netip.AddrPort{}, false
+			}
+		}
+	}
 	isDataPacket = true
 	return
 }
@@ -964,6 +995,12 @@ func (s *Server) packetReadLoop(readFromSocket, otherSocket batching.Conn, readF
 
 var ErrServerClosed = errors.New("server closed")
 
+// ErrEndpointPolicy rejects missing, expired or invalid allocation authority.
+var ErrEndpointPolicy = errors.New("invalid relay endpoint policy")
+
+// ErrEndpointLimit reports the configured allocation capacity.
+var ErrEndpointLimit = errors.New("relay endpoint capacity exhausted")
+
 // ErrServerNotReady indicates the server is not ready. Allocation should be
 // requested after waiting for at least RetryAfter duration.
 type ErrServerNotReady struct {
@@ -1011,10 +1048,74 @@ func (s *Server) getAllAddrPortsCopyLocked() []netip.AddrPort {
 //  1. [ErrServerClosed] if the server has been closed.
 //  2. [ErrServerNotReady] if the server is not ready.
 func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.ServerEndpoint, error) {
+	return s.allocateEndpoint(discoA, discoB, time.Time{}, 0)
+}
+
+// AllocateEndpointWithPolicy allocates or renews an endpoint under already verified
+// authority. The caller owns account/scope/generation checks. Every data and bind
+// packet is fenced by expiresAt; maxEndpoints bounds the server's allocation set.
+// Renewing live authority preserves VNI and LamportID. Expired allocations get a
+// fresh VNI. Use RevokeEndpoint when authority is removed before expiry.
+func (s *Server) AllocateEndpointWithPolicy(discoA, discoB key.DiscoPublic, expiresAt time.Time, maxEndpoints int) (endpoint.ServerEndpoint, error) {
+	if !expiresAt.After(time.Now()) || maxEndpoints < 1 || maxEndpoints > int(totalPossibleVNI) || discoA.IsZero() || discoB.IsZero() || discoA == discoB {
+		return endpoint.ServerEndpoint{}, ErrEndpointPolicy
+	}
+	return s.allocateEndpoint(discoA, discoB, expiresAt, maxEndpoints)
+}
+
+// SetEndpointAuthorizer installs a bounded live-authorization check for every
+// known allocation's bind/data packet. It runs without Server.mu held and must
+// be concurrency-safe. Nil restores upstream behavior; Paperboat installs this
+// before advertising the server. Replacing it is atomic.
+func (s *Server) SetEndpointAuthorizer(authorize func(key.DiscoPublic, key.DiscoPublic) bool) {
+	if authorize == nil {
+		s.endpointAuthorizer.Store(nil)
+	} else {
+		s.endpointAuthorizer.Store(&authorize)
+	}
+}
+
+// SetForwardingLimiter installs a concurrency-safe quota check called only after
+// a data packet matches a bound source. It runs without endpoint/Server locks;
+// forged sources cannot debit another account's forwarding quota. Nil disables it.
+func (s *Server) SetForwardingLimiter(limit func(key.DiscoPublic, key.DiscoPublic) bool) {
+	if limit == nil {
+		s.forwardingLimiter.Store(nil)
+	} else {
+		s.forwardingLimiter.Store(&limit)
+	}
+}
+
+// RevokeEndpoint fences existing packet-handler references before removing both
+// indexes. Revocation is idempotent; a later trusted allocation receives a new VNI.
+func (s *Server) RevokeEndpoint(discoA, discoB key.DiscoPublic) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pair := key.NewSortedPairOfDiscoPublic(discoA, discoB)
+	if e := s.serverEndpointByDisco[pair]; e != nil {
+		e.mu.Lock()
+		before := e.stateLocked()
+		e.closed = true
+		s.metrics.updateEndpoint(before, e.stateLocked())
+		e.mu.Unlock()
+		delete(s.serverEndpointByDisco, pair)
+		s.serverEndpointByVNI.Delete(e.vni)
+	}
+}
+
+func (s *Server) allocateEndpoint(discoA, discoB key.DiscoPublic, expiresAt time.Time, maxEndpoints int) (endpoint.ServerEndpoint, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return endpoint.ServerEndpoint{}, ErrServerClosed
+	}
+
+	if discoA.IsZero() || discoB.IsZero() {
+		// DiscoPrivate.Shared, called below for each client key, rejects
+		// zero keys. A zero key indicates a malformed or malicious
+		// [disco.AllocateUDPRelayEndpointRequest], whose ClientDisco values
+		// are attacker-chosen.
+		return endpoint.ServerEndpoint{}, errors.New("zero client disco key")
 	}
 
 	if s.staticAddrPorts.Len() == 0 && len(s.dynamicAddrPorts) == 0 {
@@ -1025,9 +1126,34 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 		return endpoint.ServerEndpoint{}, fmt.Errorf("client disco equals server disco: %s", s.discoPublic.ShortString())
 	}
 
+	var policyDeadline mono.Time
+	if !expiresAt.IsZero() {
+		remaining := time.Until(expiresAt)
+		if remaining <= 0 {
+			return endpoint.ServerEndpoint{}, ErrEndpointPolicy
+		}
+		policyDeadline = mono.Now().Add(remaining)
+		for pair, old := range s.serverEndpointByDisco {
+			if old.maybeExpire(mono.Now(), s.bindLifetime, s.steadyStateLifetime, s.metrics) {
+				delete(s.serverEndpointByDisco, pair)
+				s.serverEndpointByVNI.Delete(old.vni)
+			}
+		}
+	}
 	pair := key.NewSortedPairOfDiscoPublic(discoA, discoB)
 	e, ok := s.serverEndpointByDisco[pair]
+	if !ok && maxEndpoints > 0 && len(s.serverEndpointByDisco) >= maxEndpoints {
+		return endpoint.ServerEndpoint{}, ErrEndpointLimit
+	}
 	if ok {
+		e.mu.Lock()
+		// Only the policy API may renew policy-governed allocations.
+		if !e.policyDeadline.IsZero() && policyDeadline.IsZero() {
+			e.mu.Unlock()
+			return endpoint.ServerEndpoint{}, ErrEndpointPolicy
+		}
+		e.policyDeadline = policyDeadline
+		e.mu.Unlock()
 		// Return the existing allocation. Clients can resolve duplicate
 		// [endpoint.ServerEndpoint]'s via [endpoint.ServerEndpoint.LamportID].
 		//
@@ -1044,8 +1170,8 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 			AddrPorts:           s.getAllAddrPortsCopyLocked(),
 			VNI:                 e.vni,
 			LamportID:           e.lamportID,
-			BindLifetime:        tstime.GoDuration{Duration: s.bindLifetime},
-			SteadyStateLifetime: tstime.GoDuration{Duration: s.steadyStateLifetime},
+			BindLifetime:        tstime.GoDuration{Duration: policyLifetime(s.bindLifetime, policyDeadline)},
+			SteadyStateLifetime: tstime.GoDuration{Duration: policyLifetime(s.steadyStateLifetime, policyDeadline)},
 		}, nil
 	}
 
@@ -1056,10 +1182,11 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 
 	s.lamportID++
 	e = &serverEndpoint{
-		discoPubKeys: pair,
-		lamportID:    s.lamportID,
-		allocatedAt:  mono.Now(),
-		vni:          vni,
+		discoPubKeys:   pair,
+		lamportID:      s.lamportID,
+		allocatedAt:    mono.Now(),
+		policyDeadline: policyDeadline,
+		vni:            vni,
 	}
 	e.discoSharedSecrets[0] = s.disco.Shared(e.discoPubKeys.Get()[0])
 	e.discoSharedSecrets[1] = s.disco.Shared(e.discoPubKeys.Get()[1])
@@ -1075,9 +1202,16 @@ func (s *Server) AllocateEndpoint(discoA, discoB key.DiscoPublic) (endpoint.Serv
 		AddrPorts:           s.getAllAddrPortsCopyLocked(),
 		VNI:                 e.vni,
 		LamportID:           e.lamportID,
-		BindLifetime:        tstime.GoDuration{Duration: s.bindLifetime},
-		SteadyStateLifetime: tstime.GoDuration{Duration: s.steadyStateLifetime},
+		BindLifetime:        tstime.GoDuration{Duration: policyLifetime(s.bindLifetime, policyDeadline)},
+		SteadyStateLifetime: tstime.GoDuration{Duration: policyLifetime(s.steadyStateLifetime, policyDeadline)},
 	}, nil
+}
+
+func policyLifetime(lifetime time.Duration, deadline mono.Time) time.Duration {
+	if deadline.IsZero() {
+		return lifetime
+	}
+	return max(0, min(lifetime, deadline.Sub(mono.Now())))
 }
 
 // extractClientInfo constructs a [status.ClientInfo] for both relay clients
