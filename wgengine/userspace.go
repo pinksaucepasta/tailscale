@@ -46,6 +46,7 @@ import (
 	"tailscale.com/types/ipproto"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/nettype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/checkchange"
 	"tailscale.com/util/clientmetric"
@@ -220,6 +221,12 @@ type Config struct {
 	// advertise to DERP servers for stats purposes. It is passed
 	// through to magicsock.
 	DERPAppName string
+
+	// DERPCarrierFactory replaces the default DERP connection when set.
+	DERPCarrierFactory magicsock.DERPCarrierFactory
+
+	// TestOnlyPacketListener injects real packet sockets for isolated path tests.
+	TestOnlyPacketListener nettype.PacketListener
 
 	// ControlKnobs is the set of control plane-provied knobs
 	// to use.
@@ -427,21 +434,23 @@ func NewUserspaceEngine(logf logger.Logf, conf Config) (_ Engine, reterr error) 
 		e.RequestStatus()
 	}
 	magicsockOpts := magicsock.Options{
-		EventBus:       e.eventBus,
-		Logf:           logf,
-		Port:           conf.ListenPort,
-		EndpointsFunc:  endpointsFn,
-		DERPActiveFunc: e.RequestStatus,
-		IdleFunc:       e.tundev.IdleDuration,
-		NetMon:         e.netMon,
-		HealthTracker:  e.health,
-		ExtraRootCAs:   conf.ExtraRootCAs,
-		DERPAppName:    conf.DERPAppName,
-		Metrics:        conf.Metrics,
-		ControlKnobs:   conf.ControlKnobs,
-		PeerByKeyFunc:  e.PeerByKey,
-		ForceDiscoKey:  conf.ForceDiscoKey,
-		OnDERPRecv:     conf.OnDERPRecv,
+		EventBus:               e.eventBus,
+		Logf:                   logf,
+		Port:                   conf.ListenPort,
+		EndpointsFunc:          endpointsFn,
+		DERPActiveFunc:         e.RequestStatus,
+		IdleFunc:               e.tundev.IdleDuration,
+		NetMon:                 e.netMon,
+		HealthTracker:          e.health,
+		ExtraRootCAs:           conf.ExtraRootCAs,
+		DERPAppName:            conf.DERPAppName,
+		DERPCarrierFactory:     conf.DERPCarrierFactory,
+		TestOnlyPacketListener: conf.TestOnlyPacketListener,
+		Metrics:                conf.Metrics,
+		ControlKnobs:           conf.ControlKnobs,
+		PeerByKeyFunc:          e.PeerByKey,
+		ForceDiscoKey:          conf.ForceDiscoKey,
+		OnDERPRecv:             conf.OnDERPRecv,
 	}
 	var err error
 	e.magicConn, err = magicsock.NewConn(magicsockOpts)

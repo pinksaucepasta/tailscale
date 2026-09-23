@@ -1866,6 +1866,9 @@ func (de *endpoint) noteConnectivityChange() {
 	defer de.mu.Unlock()
 
 	de.clearBestAddrLocked()
+	// Rebinding invalidates the selected relay path too. Do not wait for the
+	// normal discovery interval before binding the current socket to its relay.
+	de.lastUDPRelayPathDiscovery = 0
 
 	for k := range de.endpointState {
 		de.endpointState[k].clear()
