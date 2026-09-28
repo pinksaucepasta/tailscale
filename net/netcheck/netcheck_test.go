@@ -480,7 +480,10 @@ func TestAddReportHistoryAndSetPreferredDERP(t *testing.T) {
 				TimeNow:            func() time.Time { return fakeTime },
 				ForcePreferredDERP: tt.forcedDERP,
 			}
-			dm := &tailcfg.DERPMap{HomeParams: tt.homeParams}
+			dm := &tailcfg.DERPMap{HomeParams: tt.homeParams, Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{}}
+			for _, id := range []tailcfg.DERPRegionID{1, 2, 3} {
+				dm.Regions[id] = &tailcfg.DERPRegion{RegionID: id, Nodes: []*tailcfg.DERPNode{{}}}
+			}
 			rs := &reportState{
 				c:     c,
 				start: fakeTime,
