@@ -275,3 +275,22 @@ type DERPAdmitClientResponse struct {
 
 	// TODO(bradfitz,maisem): bandwidth limits, etc?
 }
+
+// HasDERP reports whether the region contains a DERP-capable node.
+// STUN-only and empty regions can provide no relay home.
+func (r *DERPRegion) HasDERP() bool {
+	return r.View().HasDERP()
+}
+
+// HasDERP reports whether the region contains a DERP-capable node.
+func (r DERPRegionView) HasDERP() bool {
+	if !r.Valid() {
+		return false
+	}
+	for _, n := range r.Nodes().All() {
+		if n.Valid() && !n.STUNOnly() {
+			return true
+		}
+	}
+	return false
+}

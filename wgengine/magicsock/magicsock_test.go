@@ -604,14 +604,14 @@ func TestPickDERPFallback(t *testing.T) {
 	c := newConn(t.Logf)
 	dm := &tailcfg.DERPMap{
 		Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
-			1: {},
-			2: {},
-			3: {},
-			4: {},
-			5: {},
-			6: {},
-			7: {},
-			8: {},
+			1: {Nodes: []*tailcfg.DERPNode{{}}},
+			2: {Nodes: []*tailcfg.DERPNode{{}}},
+			3: {Nodes: []*tailcfg.DERPNode{{}}},
+			4: {Nodes: []*tailcfg.DERPNode{{}}},
+			5: {Nodes: []*tailcfg.DERPNode{{}}},
+			6: {Nodes: []*tailcfg.DERPNode{{}}},
+			7: {Nodes: []*tailcfg.DERPNode{{}}},
+			8: {Nodes: []*tailcfg.DERPNode{{}}},
 		},
 	}
 	c.derpMap = dm
@@ -643,6 +643,7 @@ func TestPickDERPFallback(t *testing.T) {
 
 	// Test that stickiness works.
 	const someNode = 123456
+	dm.Regions[someNode] = &tailcfg.DERPRegion{Nodes: []*tailcfg.DERPNode{{}}}
 	c.myDerp = someNode
 	if got := c.pickDERPFallback(); got != someNode {
 		t.Errorf("not sticky: got %v; want %v", got, someNode)

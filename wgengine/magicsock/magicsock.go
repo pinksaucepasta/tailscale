@@ -1302,10 +1302,6 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 	var already map[netip.AddrPort]tailcfg.EndpointType // endpoint -> how it was found
 	var eps []tailcfg.Endpoint                          // unique endpoints
 
-	ipp := func(s string) (ipp netip.AddrPort) {
-		ipp, _ = netip.ParseAddrPort(s)
-		return
-	}
 	addAddr := func(ipp netip.AddrPort, et tailcfg.EndpointType) {
 		if !ipp.IsValid() || (debugOmitLocalAddresses() && et == tailcfg.EndpointLocal) {
 			return
@@ -1393,26 +1389,12 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 		addAddr(ep, tailcfg.EndpointExplicitConf)
 	}
 
-	if localAddr := c.pconn4.LocalAddr(); localAddr.IP.IsUnspecified() {
-		ips, loopback, err := netmon.LocalAddresses()
-		if err != nil {
-			return nil, err
-		}
-		if len(ips) == 0 && len(eps) == 0 {
-			// Only include loopback addresses if we have no
-			// interfaces at all to use as endpoints and don't
-			// have a public IPv4 or IPv6 address. This allows
-			// for localhost testing when you're on a plane and
-			// offline, for example.
-			ips = loopback
-		}
-		for _, ip := range ips {
-			addAddr(netip.AddrPortFrom(ip, uint16(localAddr.Port)), tailcfg.EndpointLocal)
-		}
-	} else {
-		// Our local endpoint is bound to a particular address.
-		// Do not offer addresses on other local interfaces.
-		addAddr(ipp(localAddr.String()), tailcfg.EndpointLocal)
+	localEndpoints, err := localEndpointCandidates(c.pconn4.LocalAddr(), c.pconn6.LocalAddr(), len(eps) > 0, netmon.LocalAddresses)
+	if err != nil {
+		return nil, err
+	}
+	for _, ep := range localEndpoints {
+		addAddr(ep, tailcfg.EndpointLocal)
 	}
 
 	// Note: the endpoints are intentionally returned in priority order,
@@ -1429,6 +1411,42 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 	// Despite this sorting, though, clients since 0.100 haven't relied
 	// on the sorting order for any decisions.
 	return eps, nil
+}
+
+// localEndpointCandidates returns interface candidates for the bound UDP sockets.
+func localEndpointCandidates(local4, local6 *net.UDPAddr, haveEndpoints bool, addresses func() (ips, loopback []netip.Addr, err error)) ([]netip.AddrPort, error) {
+	var endpoints []netip.AddrPort
+	var ips []netip.Addr
+	if (local4.Port != 0 && local4.IP.IsUnspecified()) || (local6.Port != 0 && local6.IP.IsUnspecified()) {
+		var loopback []netip.Addr
+		var err error
+		ips, loopback, err = addresses()
+		if err != nil {
+			return nil, err
+		}
+		// Only use loopback when there are no interfaces or previously
+		// discovered endpoints, preserving offline localhost operation.
+		if len(ips) == 0 && !haveEndpoints {
+			ips = loopback
+		}
+	}
+	for family, local := range []*net.UDPAddr{local4, local6} {
+		// An unavailable socket (including blockForeverConn) has port zero.
+		if local.Port == 0 {
+			continue
+		}
+		if !local.IP.IsUnspecified() {
+			// A specific bind must not advertise other interface addresses.
+			endpoints = append(endpoints, local.AddrPort())
+			continue
+		}
+		for _, ip := range ips {
+			if ip.Is4() == (family == 0) {
+				endpoints = append(endpoints, netip.AddrPortFrom(ip, uint16(local.Port)))
+			}
+		}
+	}
+	return endpoints, nil
 }
 
 // endpointSetsEqual reports whether x and y represent the same set of
