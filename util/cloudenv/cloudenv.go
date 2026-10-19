@@ -155,13 +155,9 @@ func getCloud() Cloud {
 		if prod == "Google Compute Engine" {
 			return GCP
 		}
-		if prod == "Google" { // old GCP VMs, it seems
-			hitMetadata = true
-		}
-		if prod == "Virtual Machine" || biosVendor == "Microsoft Corporation" {
-			// Azure, or maybe all Hyper-V?
-			hitMetadata = true
-		}
+		// Paperboat never uses the cloud identity, so the metadata server is not
+		// probed for old GCP, Azure or Hyper-V guests: that probe costs up to 2
+		// seconds on every cold start of a Hyper-V VM.
 
 	default:
 		// TODO(bradfitz): use Win32_SystemEnclosure from WMI or something on
