@@ -743,6 +743,7 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc DERPCarrier, ch <-chan derp
 			} else {
 				err = dc.Send(wr.pubKey, wr.b)
 			}
+			c.traceUnderlayPacket(false, wr.b, wr.addr, err != nil, "derp")
 			if err != nil {
 				c.logf("magicsock: derp.Send(%v): %v", wr.addr, err)
 				metricSendDERPError.Add(1)
@@ -794,6 +795,7 @@ func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep *en
 	}
 
 	srcAddr := epAddr{ap: netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(regionID))}
+	c.traceUnderlayPacket(true, b[:n], srcAddr.ap, false, "derp")
 	pt, isGeneveEncap := packetLooksLike(b[:n])
 	if pt == packetLooksLikeDisco &&
 		!isGeneveEncap { // We should never receive Geneve-encapsulated disco over DERP.

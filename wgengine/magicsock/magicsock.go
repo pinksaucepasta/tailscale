@@ -240,7 +240,8 @@ type Conn struct {
 	// networkUp is whether the network is up (some interface is up
 	// with IPv4 or IPv6). It's used to suppress log spam and prevent
 	// new connection that'll fail.
-	networkUp atomic.Bool
+	networkUp                       atomic.Bool
+	underlayIngress, underlayEgress atomic.Int64
 
 	// Whether debugging logging is enabled.
 	debugLogging atomic.Bool
@@ -1561,6 +1562,11 @@ func (c *Conn) sendUDPBatch(addr epAddr, buffs [][]byte, offset int) (sent bool,
 			c.maybeRebindOnError(err)
 		}
 	}
+	for _, b := range buffs {
+		if offset >= 0 && offset <= len(b) {
+			c.traceUnderlayPacket(false, b[offset:], addr.ap, err != nil, "udp")
+		}
+	}
 	return err == nil, err
 }
 
@@ -1571,6 +1577,11 @@ func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte, isDisco bool, isGeneveEncap
 		return false, errNoUDP
 	}
 	sent, err = c.sendUDPStd(ipp, b)
+	trace := b
+	if isGeneveEncap && len(trace) >= packet.GeneveFixedHeaderLength {
+		trace = trace[packet.GeneveFixedHeaderLength:]
+	}
+	c.traceUnderlayPacket(false, trace, ipp, err != nil || !sent, "udp")
 	if err != nil {
 		if isGeneveEncap {
 			metricSendPeerRelayError.Add(1)
@@ -1837,6 +1848,11 @@ func (c *Conn) receiveIP(b []byte, ipp netip.AddrPort, cache *epAddrEndpointCach
 		}
 		src.vni = geneve.VNI
 	}
+	trace := b
+	if isGeneveEncap {
+		trace = trace[packet.GeneveFixedHeaderLength:]
+	}
+	c.traceUnderlayPacket(true, trace, ipp, false, "udp")
 	switch pt {
 	case packetLooksLikeDisco:
 		if isGeneveEncap {
