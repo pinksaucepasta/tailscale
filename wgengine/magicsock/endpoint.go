@@ -94,7 +94,11 @@ type endpoint struct {
 	trustBestAddrUntil mono.Time   // time when bestAddr expires
 	sentPing           map[stun.TxID]sentPing
 	endpointState      map[netip.AddrPort]*endpointState // netip.AddrPort type for key (instead of [epAddr]) as [endpointState] is irrelevant for Geneve-encapsulated paths
-	isCallMeMaybeEP    map[netip.AddrPort]bool
+	// pathLoss is the heartbeat loss record of each direct address that was bestAddr. It
+	// is kept apart from endpointState, which call-me-maybe and netmap churn delete and
+	// re-create, so a lossy path keeps its hold-down; a network change clears it.
+	pathLoss        map[netip.AddrPort]*pathLoss
+	isCallMeMaybeEP map[netip.AddrPort]bool
 
 	// The following fields are related to the new "silent disco"
 	// implementation that's a WIP as of 2022-10-20.
@@ -474,16 +478,6 @@ type endpointState struct {
 
 	recentPongs []pongReply // ring buffer up to pongHistoryCount entries
 	recentPong  uint16      // index into recentPongs of most recent; older before, wrapped
-
-	// heartbeatLost holds the last heartbeatHistory heartbeat results while
-	// this address was bestAddr, newest in bit 0 (1 = no pong in time);
-	// heartbeatCount is how many of those bits are filled.
-	heartbeatLost  uint16
-	heartbeatCount uint8
-	// lossyUntil, if in the future, keeps this lossy address from becoming
-	// bestAddr, so the peer is reached over DERP or a peer relay instead.
-	lossyUntil mono.Time
-	lossyCount uint8 // demotions in a row without a clean window since; scales the hold-down
 
 	index int16 // index in nodecfg.Node.Endpoints; meaningless if lastGotPing non-zero
 }
@@ -1310,7 +1304,17 @@ const (
 	// does not flap between direct and relay.
 	lossyHoldDown    = 30 * time.Second
 	lossyHoldDownMax = 8 * time.Minute
+	// pathLossMax bounds endpoint.pathLoss.
+	pathLossMax = 16
 )
+
+// pathLoss is the heartbeat loss record of one direct address.
+type pathLoss struct {
+	lost      uint16    // last heartbeatHistory heartbeats while bestAddr, newest in bit 0 (1 = no pong in time)
+	count     uint8     // how many bits of lost are filled
+	until     mono.Time // while in the future, the address may not become bestAddr
+	demotions uint8     // demotions without a clean window since; scales the hold-down
+}
 
 // noteHeartbeatResultLocked records one heartbeat result for the direct address
 // ap (the current bestAddr) and demotes ap when the window holds too much loss.
@@ -1319,30 +1323,32 @@ const (
 //
 // de.mu must be held.
 func (de *endpoint) noteHeartbeatResultLocked(ap netip.AddrPort, lost bool) {
-	st, ok := de.endpointState[ap]
-	if !ok {
-		return
+	st := de.pathLoss[ap]
+	if st == nil {
+		if len(de.pathLoss) >= pathLossMax {
+			clear(de.pathLoss) // shortcut: forgets every record when full; only past bestAddrs get one
+		}
+		st = new(pathLoss)
+		mak.Set(&de.pathLoss, ap, st)
 	}
-	st.heartbeatLost <<= 1
+	st.lost <<= 1
 	if lost {
-		st.heartbeatLost |= 1
+		st.lost |= 1
 	}
-	st.heartbeatLost &= 1<<heartbeatHistory - 1
-	if st.heartbeatCount < heartbeatHistory {
-		st.heartbeatCount++
+	st.lost &= 1<<heartbeatHistory - 1
+	if st.count < heartbeatHistory {
+		st.count++
 	}
 	// A path is demoted as soon as heartbeatLossyAt losses are in the window, even before it
-	// fills, so a lossy path is not kept for a full window first; only a full clean window
-	// resets the hold-down doubling.
-	switch n := bits.OnesCount16(st.heartbeatLost); {
-	case n == 0 && st.heartbeatCount == heartbeatHistory:
-		st.lossyCount = 0
-	case lost && n >= heartbeatLossyAt:
-		hold := min(lossyHoldDown<<min(st.lossyCount, 8), lossyHoldDownMax)
-		st.lossyCount++
-		// The window is kept: if the path is promoted again after the hold-down, its
-		// first lost heartbeat demotes it again; clean ones shift the old losses out.
-		st.lossyUntil = mono.Now().Add(hold)
+	// fills. A path demoted before is on probation until a full clean window: its first lost
+	// heartbeat demotes it again, however many clean ones came since it was promoted.
+	switch n := bits.OnesCount16(st.lost); {
+	case n == 0 && st.count == heartbeatHistory:
+		st.demotions = 0
+	case lost && (n >= heartbeatLossyAt || st.demotions > 0):
+		hold := min(lossyHoldDown<<min(st.demotions, 8), lossyHoldDownMax)
+		st.demotions++
+		st.until = mono.Now().Add(hold)
 		de.c.logf("magicsock: disco: node %v %v lost %d of %d heartbeats on %v; using relay for %v",
 			de.publicKey.ShortString(), de.discoShort(), n, heartbeatHistory, ap, hold)
 		de.clearBestAddrLocked()
@@ -1942,6 +1948,7 @@ func (de *endpoint) noteConnectivityChange() {
 	for k := range de.endpointState {
 		de.endpointState[k].clear()
 	}
+	clear(de.pathLoss)
 }
 
 // pingSizeToPktLen calculates the minimum path MTU that would permit
@@ -2057,8 +2064,8 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 		}
 		bestUntrusted := now.After(de.trustBestAddrUntil)
 		lossy := false
-		if st, ok := de.endpointState[sp.to.ap]; ok && sp.to.isDirect() {
-			lossy = !st.lossyUntil.IsZero() && now.Before(st.lossyUntil)
+		if st := de.pathLoss[sp.to.ap]; st != nil && sp.to.isDirect() {
+			lossy = !st.until.IsZero() && now.Before(st.until)
 		}
 		if !lossy && (betterAddr(thisPong, de.bestAddr) || bestUntrusted) {
 			de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])

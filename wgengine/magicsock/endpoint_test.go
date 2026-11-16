@@ -5,7 +5,6 @@ package magicsock
 
 import (
 	"fmt"
-	"math/bits"
 	"net/netip"
 	"testing"
 	"testing/synctest"
@@ -1324,7 +1323,7 @@ func Test_endpoint_lossyDirectPathFallsBackToRelay(t *testing.T) {
 		if de.bestAddr.epAddr == direct {
 			t.Fatal("still lossy path not demoted again on its first lost heartbeat")
 		}
-		if got, want := de.endpointState[direct.ap].lossyUntil.Sub(mono.Now()), 2*lossyHoldDown; got != want {
+		if got, want := de.pathLoss[direct.ap].until.Sub(mono.Now()), 2*lossyHoldDown; got != want {
 			t.Fatalf("second hold-down = %v, want %v", got, want)
 		}
 		time.Sleep(2 * lossyHoldDown)
@@ -1336,8 +1335,8 @@ func Test_endpoint_lossyDirectPathFallsBackToRelay(t *testing.T) {
 		if de.bestAddr.epAddr != direct {
 			t.Fatal("recovered path dropped on one lost heartbeat after a clean window")
 		}
-		if n := de.endpointState[direct.ap].lossyCount; n != 0 {
-			t.Fatalf("lossyCount = %d after a clean window, want 0", n)
+		if n := de.pathLoss[direct.ap].demotions; n != 0 {
+			t.Fatalf("demotions = %d after a clean window, want 0", n)
 		}
 	})
 }
@@ -1380,8 +1379,63 @@ func Test_endpoint_lossyHeartbeatCountsAfterTrustExpires(t *testing.T) {
 		if de.bestAddr.epAddr == direct {
 			t.Fatal("path losing every other heartbeat is still bestAddr")
 		}
-		if st := de.endpointState[direct.ap]; st.lossyUntil.IsZero() {
-			t.Fatalf("no hold-down after %d lost heartbeats", bits.OnesCount16(st.heartbeatLost))
+		if st := de.pathLoss[direct.ap]; st == nil || st.until.IsZero() {
+			t.Fatal("no hold-down after every other heartbeat was lost")
+		}
+	})
+}
+
+// Call-me-maybe and netmap churn delete and re-create a peer's endpointState; a lossy
+// path keeps its hold-down through that, and once promoted again it is dropped on its
+// first lost heartbeat even after a run of clean ones.
+func Test_endpoint_lossyPathSurvivesEndpointChurn(t *testing.T) {
+	direct := epAddr{ap: netip.MustParseAddrPort("192.0.2.1:7")}
+	synctest.Test(t, func(t *testing.T) {
+		c := &Conn{logf: func(string, ...any) {}, peerMap: newPeerMap()}
+		c.discoAtomic.Set(key.NewDisco())
+		de := &endpoint{
+			c:             c,
+			sentPing:      make(map[stun.TxID]sentPing),
+			endpointState: map[netip.AddrPort]*endpointState{direct.ap: {}},
+			debugUpdates:  ringlog.New[EndpointChange](10),
+		}
+		di := &discoInfo{discoKey: key.NewDisco().Public(), discoShort: "test"}
+		ping := func(purpose discoPingPurpose, lost bool) {
+			time.Sleep(heartbeatInterval)
+			txid := stun.NewTxID()
+			timer := time.NewTimer(time.Hour)
+			timer.Stop()
+			de.sentPing[txid] = sentPing{to: direct, at: mono.Now().Add(-10 * time.Millisecond), timer: timer, purpose: purpose}
+			if lost {
+				de.discoPingTimeout(txid)
+				return
+			}
+			de.handlePongConnLocked(&disco.Pong{TxID: txid, Src: direct.ap}, di, direct)
+		}
+		ping(pingDiscovery, false)
+		for i := 0; de.bestAddr.epAddr == direct; i++ {
+			if i == heartbeatHistory {
+				t.Fatal("path losing every heartbeat is still bestAddr")
+			}
+			ping(pingHeartbeat, true)
+		}
+		de.deleteEndpointLocked("test", direct.ap)
+		de.endpointState[direct.ap] = &endpointState{}
+		ping(pingDiscovery, false)
+		if de.bestAddr.epAddr == direct {
+			t.Fatal("re-created endpoint state lost the hold-down")
+		}
+		time.Sleep(lossyHoldDown)
+		ping(pingDiscovery, false)
+		if de.bestAddr.epAddr != direct {
+			t.Fatal("path not re-promoted after the hold-down")
+		}
+		for range heartbeatHistory - 1 { // a lucky run that shifts the old losses out
+			ping(pingHeartbeat, false)
+		}
+		ping(pingHeartbeat, true)
+		if de.bestAddr.epAddr == direct {
+			t.Fatal("re-promoted path kept after a lost heartbeat before a clean window")
 		}
 	})
 }
