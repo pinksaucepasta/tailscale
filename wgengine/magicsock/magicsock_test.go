@@ -1334,14 +1334,20 @@ func testTwoDevicePing(t *testing.T, d *devices) {
 	}
 
 	addrPort := netip.MustParseAddrPort
-	m1Conns := []netlogtype.Connection{
-		{Src: addrPort("1.0.0.2:0"), Dst: m2.conn.pconn4.LocalAddr().AddrPort()},
-		{Src: addrPort("1.0.0.2:0"), Dst: addrPort("127.3.3.40:1")},
+	// Any path to the peer counts: its IPv4 or IPv6 socket (on loopback both work,
+	// and betterAddr's IPv6 bonus picks either depending on measured latency) or DERP.
+	conns := func(src string, peer *magicStack) []netlogtype.Connection {
+		cs := []netlogtype.Connection{
+			{Src: addrPort(src), Dst: peer.conn.pconn4.LocalAddr().AddrPort()},
+			{Src: addrPort(src), Dst: addrPort("127.3.3.40:1")},
+		}
+		if a := peer.conn.pconn6.LocalAddr(); a != nil {
+			cs = append(cs, netlogtype.Connection{Src: addrPort(src), Dst: a.AddrPort()})
+		}
+		return cs
 	}
-	m2Conns := []netlogtype.Connection{
-		{Src: addrPort("1.0.0.1:0"), Dst: m1.conn.pconn4.LocalAddr().AddrPort()},
-		{Src: addrPort("1.0.0.1:0"), Dst: addrPort("127.3.3.40:1")},
-	}
+	m1Conns := conns("1.0.0.2:0", m2)
+	m2Conns := conns("1.0.0.1:0", m1)
 
 	outerT := t
 	t.Run("ping-1_0_0_1", func(t *testing.T) {
@@ -4320,6 +4326,7 @@ func TestConn_receiveIP(t *testing.T) {
 
 			// Init Conn.
 			c := &Conn{
+				logf:       logger.Discard, // receiveIP traces underlay packets through logf
 				privateKey: key.NewNode(),
 				netChecker: &netcheck.Client{},
 				peerMap:    newPeerMap(),
