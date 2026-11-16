@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"iter"
 	"math"
+	"math/bits"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -473,6 +474,16 @@ type endpointState struct {
 
 	recentPongs []pongReply // ring buffer up to pongHistoryCount entries
 	recentPong  uint16      // index into recentPongs of most recent; older before, wrapped
+
+	// heartbeatLost holds the last heartbeatHistory heartbeat results while
+	// this address was bestAddr, newest in bit 0 (1 = no pong in time);
+	// heartbeatCount is how many of those bits are filled.
+	heartbeatLost  uint16
+	heartbeatCount uint8
+	// lossyUntil, if in the future, keeps this lossy address from becoming
+	// bestAddr, so the peer is reached over DERP or a peer relay instead.
+	lossyUntil mono.Time
+	lossyCount uint8 // demotions in a row without a clean window since; scales the hold-down
 
 	index int16 // index in nodecfg.Node.Endpoints; meaningless if lastGotPing non-zero
 }
@@ -1277,7 +1288,61 @@ func (de *endpoint) removeSentDiscoPingLocked(txid stun.TxID, sp sentPing, resul
 	if sp.purpose == pingHeartbeatForUDPLifetime {
 		de.probeUDPLifetimeCliffDoneLocked(result, txid)
 	}
+	if sp.purpose == pingHeartbeat && sp.to.isDirect() && sp.to == de.bestAddr.epAddr {
+		de.noteHeartbeatResultLocked(sp.to.ap, result != discoPongReceived)
+	}
 	delete(de.sentPing, txid)
+}
+
+const (
+	// heartbeatHistory is how many heartbeats to bestAddr make up the loss window
+	// (heartbeatInterval apart: 30 s).
+	heartbeatHistory = 10
+	// heartbeatLossyAt is how many lost heartbeats in the window demote a direct
+	// address. A path losing that much (30%) carries traffic worse than a clean
+	// relay; Paperboat measured 16-61% loss on such paths at 1/10 the relay rate.
+	heartbeatLossyAt = 3
+	// lossyHoldDown is the first hold-down of a demoted address; it doubles with
+	// each demotion in a row, up to lossyHoldDownMax, so a path that stays bad
+	// does not flap between direct and relay.
+	lossyHoldDown    = 30 * time.Second
+	lossyHoldDownMax = 8 * time.Minute
+)
+
+// noteHeartbeatResultLocked records one heartbeat result for the direct address
+// ap (the current bestAddr) and demotes ap when the window holds too much loss.
+// Tailscale keeps any address that answers one pong per trustUDPAddrDuration, so
+// a path losing half its packets would otherwise stay preferred over DERP.
+//
+// de.mu must be held.
+func (de *endpoint) noteHeartbeatResultLocked(ap netip.AddrPort, lost bool) {
+	st, ok := de.endpointState[ap]
+	if !ok {
+		return
+	}
+	st.heartbeatLost <<= 1
+	if lost {
+		st.heartbeatLost |= 1
+	}
+	st.heartbeatLost &= 1<<heartbeatHistory - 1
+	if st.heartbeatCount < heartbeatHistory {
+		st.heartbeatCount++
+	}
+	if st.heartbeatCount < heartbeatHistory {
+		return
+	}
+	switch n := bits.OnesCount16(st.heartbeatLost); {
+	case n == 0:
+		st.lossyCount = 0
+	case n >= heartbeatLossyAt:
+		hold := min(lossyHoldDown<<min(st.lossyCount, 8), lossyHoldDownMax)
+		st.lossyCount++
+		st.lossyUntil = mono.Now().Add(hold)
+		st.heartbeatLost, st.heartbeatCount = 0, 0
+		de.c.logf("magicsock: disco: node %v %v lost %d of %d heartbeats on %v; using relay for %v",
+			de.publicKey.ShortString(), de.discoShort(), n, heartbeatHistory, ap, hold)
+		de.clearBestAddrLocked()
+	}
 }
 
 // poly1305AuthenticatorSize is the size, in bytes, of a poly1305 authenticator.
@@ -1987,7 +2052,11 @@ func (de *endpoint) handlePongConnLocked(m *disco.Pong, di *discoInfo, src epAdd
 			wireMTU: pingSizeToPktLen(sp.size, sp.to),
 		}
 		bestUntrusted := now.After(de.trustBestAddrUntil)
-		if betterAddr(thisPong, de.bestAddr) || bestUntrusted {
+		lossy := false
+		if st, ok := de.endpointState[sp.to.ap]; ok && sp.to.isDirect() {
+			lossy = !st.lossyUntil.IsZero() && now.Before(st.lossyUntil)
+		}
+		if !lossy && (betterAddr(thisPong, de.bestAddr) || bestUntrusted) {
 			de.c.logf("magicsock: disco: node %v %v now using %v mtu=%v tx=%x", de.publicKey.ShortString(), de.discoShort(), sp.to, thisPong.wireMTU, m.TxID[:6])
 			de.debugUpdates.Add(EndpointChange{
 				When: time.Now(),
