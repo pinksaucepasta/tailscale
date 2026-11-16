@@ -1293,15 +1293,18 @@ func (de *endpoint) removeSentDiscoPingLocked(txid stun.TxID, sp sentPing, resul
 	if buildfeatures.HasNATTraversal && sp.purpose == pingHeartbeatForUDPLifetime {
 		de.probeUDPLifetimeCliffDoneLocked(result, txid)
 	}
-	if sp.purpose == pingHeartbeat && sp.to.isDirect() && sp.to == de.bestAddr.epAddr {
-		de.noteHeartbeatResultLocked(sp.to.ap, result != discoPongReceived)
+	// Only a pong or a timeout says something about the path; a local send failure or a
+	// ping cancelled by a disco key change does not.
+	if sp.purpose == pingHeartbeat && sp.to.isDirect() && sp.to == de.bestAddr.epAddr &&
+		(result == discoPongReceived || result == discoPingTimedOut) {
+		de.noteHeartbeatResultLocked(sp.to.ap, result == discoPingTimedOut)
 	}
 	delete(de.sentPing, txid)
 }
 
 const (
 	// heartbeatHistory is how many heartbeats to bestAddr make up the loss window
-	// (heartbeatInterval apart: 30 s).
+	// (heartbeatInterval apart, so about 30 s).
 	heartbeatHistory = 10
 	// heartbeatLossyAt is how many lost heartbeats in the window demote a direct
 	// address. A path losing that much (30%) carries traffic worse than a clean
@@ -1334,7 +1337,15 @@ func (de *endpoint) noteHeartbeatResultLocked(ap netip.AddrPort, lost bool) {
 	st := de.pathLoss[ap]
 	if st == nil {
 		if len(de.pathLoss) >= pathLossMax {
-			clear(de.pathLoss) // shortcut: forgets every record when full; only past bestAddrs get one
+			now := mono.Now()
+			for k, v := range de.pathLoss { // keep the records whose hold-down still runs
+				if !now.Before(v.until) {
+					delete(de.pathLoss, k)
+				}
+			}
+			if len(de.pathLoss) >= pathLossMax {
+				clear(de.pathLoss)
+			}
 		}
 		st = new(pathLoss)
 		mak.Set(&de.pathLoss, ap, st)
