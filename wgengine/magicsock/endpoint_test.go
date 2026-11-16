@@ -1260,8 +1260,9 @@ func TestChangedActiveDiscoLocked(t *testing.T) {
 // Test_endpoint_lossyDirectPathFallsBackToRelay drives heartbeats over a direct
 // path the way heartbeat, handlePongConnLocked and discoPingTimeout do: a path
 // losing every other pong is dropped for DERP, stays dropped for the hold-down
-// (pongs do not re-promote it), comes back after it, and a second demotion holds
-// twice as long. A path losing 2 of 10 stays direct.
+// (pongs do not re-promote it), comes back after it, is dropped again on its first
+// lost heartbeat, and the second demotion holds twice as long. A path losing 2 of
+// 10 stays direct, and a recovered path stays direct once clean probes refill the window.
 func Test_endpoint_lossyDirectPathFallsBackToRelay(t *testing.T) {
 	direct := epAddr{ap: netip.MustParseAddrPort("192.0.2.1:7")}
 	synctest.Test(t, func(t *testing.T) {
@@ -1318,14 +1319,24 @@ func Test_endpoint_lossyDirectPathFallsBackToRelay(t *testing.T) {
 		if de.bestAddr.epAddr != direct {
 			t.Fatal("path not re-promoted after the hold-down")
 		}
-		for i := 0; de.bestAddr.epAddr == direct; i++ {
-			if i == heartbeatHistory {
-				t.Fatal("still lossy path not demoted again")
-			}
-			ping(pingHeartbeat, i%2 == 0)
+		ping(pingHeartbeat, true) // still lossy: the kept window demotes it at once
+		if de.bestAddr.epAddr == direct {
+			t.Fatal("still lossy path not demoted again on its first lost heartbeat")
 		}
 		if got, want := de.endpointState[direct.ap].lossyUntil.Sub(mono.Now()), 2*lossyHoldDown; got != want {
 			t.Fatalf("second hold-down = %v, want %v", got, want)
+		}
+		time.Sleep(2 * lossyHoldDown)
+		ping(pingDiscovery, false)
+		for range heartbeatHistory { // recovered path: clean probes shift the old losses out
+			ping(pingHeartbeat, false)
+		}
+		ping(pingHeartbeat, true)
+		if de.bestAddr.epAddr != direct {
+			t.Fatal("recovered path dropped on one lost heartbeat after a clean window")
+		}
+		if n := de.endpointState[direct.ap].lossyCount; n != 0 {
+			t.Fatalf("lossyCount = %d after a clean window, want 0", n)
 		}
 	})
 }

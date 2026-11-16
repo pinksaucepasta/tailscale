@@ -1342,11 +1342,12 @@ func (de *endpoint) noteHeartbeatResultLocked(ap netip.AddrPort, lost bool) {
 	switch n := bits.OnesCount16(st.heartbeatLost); {
 	case n == 0:
 		st.lossyCount = 0
-	case n >= heartbeatLossyAt:
+	case lost && n >= heartbeatLossyAt:
 		hold := min(lossyHoldDown<<min(st.lossyCount, 8), lossyHoldDownMax)
 		st.lossyCount++
+		// The window is kept: if the path is promoted again after the hold-down, its
+		// first lost heartbeat demotes it again; clean ones shift the old losses out.
 		st.lossyUntil = mono.Now().Add(hold)
-		st.heartbeatLost, st.heartbeatCount = 0, 0
 		de.c.logf("magicsock: disco: node %v %v lost %d of %d heartbeats on %v; using relay for %v",
 			de.publicKey.ShortString(), de.discoShort(), n, heartbeatHistory, ap, hold)
 		de.clearBestAddrLocked()
