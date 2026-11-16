@@ -1252,13 +1252,16 @@ func (de *endpoint) discoPingTimeout(txid stun.TxID) {
 		return
 	}
 	bestUntrusted := mono.Now().After(de.trustBestAddrUntil)
+	// Record the loss while sp.to is still bestAddr: a heartbeat times out 5 s after it
+	// was sent, usually after the 6.5 s trust from the pong before it ran out, so clearing
+	// first would hide most lost heartbeats from the loss window.
+	de.removeSentDiscoPingLocked(txid, sp, discoPingTimedOut)
 	if sp.to == de.bestAddr.epAddr && bestUntrusted {
 		de.clearBestAddrLocked()
 	}
 	if debugDisco() || !de.bestAddr.ap.IsValid() || bestUntrusted {
 		de.c.dlogf("[v1] magicsock: disco: timeout waiting for pong %x from %v (%v, %v)", txid[:6], sp.to, de.publicKey.ShortString(), de.discoShort())
 	}
-	de.removeSentDiscoPingLocked(txid, sp, discoPingTimedOut)
 }
 
 // forgetDiscoPing is called when a ping fails to send.
@@ -1328,11 +1331,11 @@ func (de *endpoint) noteHeartbeatResultLocked(ap netip.AddrPort, lost bool) {
 	if st.heartbeatCount < heartbeatHistory {
 		st.heartbeatCount++
 	}
-	if st.heartbeatCount < heartbeatHistory {
-		return
-	}
+	// A path is demoted as soon as heartbeatLossyAt losses are in the window, even before it
+	// fills, so a lossy path is not kept for a full window first; only a full clean window
+	// resets the hold-down doubling.
 	switch n := bits.OnesCount16(st.heartbeatLost); {
-	case n == 0:
+	case n == 0 && st.heartbeatCount == heartbeatHistory:
 		st.lossyCount = 0
 	case lost && n >= heartbeatLossyAt:
 		hold := min(lossyHoldDown<<min(st.lossyCount, 8), lossyHoldDownMax)
