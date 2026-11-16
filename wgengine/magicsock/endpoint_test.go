@@ -1439,3 +1439,40 @@ func Test_endpoint_lossyPathSurvivesEndpointChurn(t *testing.T) {
 		}
 	})
 }
+
+// A heartbeat that fails to send locally says nothing about the path: it must not demote
+// a path on probation; a timeout does.
+func Test_endpoint_heartbeatSendFailureIsNotLoss(t *testing.T) {
+	direct := epAddr{ap: netip.MustParseAddrPort("192.0.2.1:7")}
+	synctest.Test(t, func(t *testing.T) {
+		c := &Conn{logf: func(string, ...any) {}, peerMap: newPeerMap()}
+		c.discoAtomic.Set(key.NewDisco())
+		de := &endpoint{
+			c:             c,
+			sentPing:      make(map[stun.TxID]sentPing),
+			endpointState: map[netip.AddrPort]*endpointState{direct.ap: {}},
+			debugUpdates:  ringlog.New[EndpointChange](10),
+			pathLoss:      map[netip.AddrPort]*pathLoss{direct.ap: {demotions: 1}},
+		}
+		di := &discoInfo{discoKey: key.NewDisco().Public(), discoShort: "test"}
+		sent := func(purpose discoPingPurpose) stun.TxID {
+			txid := stun.NewTxID()
+			timer := time.NewTimer(time.Hour)
+			timer.Stop()
+			de.sentPing[txid] = sentPing{to: direct, at: mono.Now().Add(-10 * time.Millisecond), timer: timer, purpose: purpose}
+			return txid
+		}
+		de.handlePongConnLocked(&disco.Pong{TxID: sent(pingDiscovery), Src: direct.ap}, di, direct)
+		if de.bestAddr.epAddr != direct {
+			t.Fatal("path not promoted")
+		}
+		de.forgetDiscoPing(sent(pingHeartbeat))
+		if de.bestAddr.epAddr != direct {
+			t.Fatal("a heartbeat send failure demoted the path")
+		}
+		de.discoPingTimeout(sent(pingHeartbeat))
+		if de.bestAddr.epAddr == direct {
+			t.Fatal("a heartbeat timeout on probation did not demote the path")
+		}
+	})
+}
