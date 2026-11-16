@@ -1256,3 +1256,76 @@ func TestChangedActiveDiscoLocked(t *testing.T) {
 		}
 	})
 }
+
+// Test_endpoint_lossyDirectPathFallsBackToRelay drives heartbeats over a direct
+// path the way heartbeat, handlePongConnLocked and discoPingTimeout do: a path
+// losing every other pong is dropped for DERP, stays dropped for the hold-down
+// (pongs do not re-promote it), comes back after it, and a second demotion holds
+// twice as long. A path losing 2 of 10 stays direct.
+func Test_endpoint_lossyDirectPathFallsBackToRelay(t *testing.T) {
+	direct := epAddr{ap: netip.MustParseAddrPort("192.0.2.1:7")}
+	synctest.Test(t, func(t *testing.T) {
+		c := &Conn{logf: func(string, ...any) {}, peerMap: newPeerMap()}
+		c.discoAtomic.Set(key.NewDisco())
+		de := &endpoint{
+			c:             c,
+			sentPing:      make(map[stun.TxID]sentPing),
+			endpointState: map[netip.AddrPort]*endpointState{direct.ap: {}},
+			debugUpdates:  ringlog.New[EndpointChange](10),
+		}
+		di := &discoInfo{discoKey: key.NewDisco().Public(), discoShort: "test"}
+		// ping sends one ping with purpose to direct and answers it or lets it time out.
+		ping := func(purpose discoPingPurpose, lost bool) {
+			time.Sleep(heartbeatInterval)
+			txid := stun.NewTxID()
+			timer := time.NewTimer(time.Hour)
+			timer.Stop()
+			de.sentPing[txid] = sentPing{to: direct, at: mono.Now().Add(-10 * time.Millisecond), timer: timer, purpose: purpose}
+			if lost {
+				de.discoPingTimeout(txid)
+				return
+			}
+			de.handlePongConnLocked(&disco.Pong{TxID: txid, Src: direct.ap}, di, direct)
+		}
+		ping(pingDiscovery, false)
+		if de.bestAddr.epAddr != direct {
+			t.Fatalf("bestAddr = %v, want %v", de.bestAddr.epAddr, direct)
+		}
+		for i := range 30 { // 2 lost in every 10: occasional Wi-Fi loss keeps the direct path
+			ping(pingHeartbeat, i%5 == 0)
+		}
+		if de.bestAddr.epAddr != direct {
+			t.Fatalf("clean path dropped: bestAddr = %v", de.bestAddr.epAddr)
+		}
+		for i := 0; de.bestAddr.epAddr == direct; i++ {
+			if i == heartbeatHistory {
+				t.Fatal("path losing half its heartbeats is still bestAddr")
+			}
+			ping(pingHeartbeat, i%2 == 0)
+		}
+		if udp, _, _ := de.addrForSendLocked(mono.Now()); udp.ap.IsValid() {
+			t.Fatalf("after demotion sends still go to %v", udp)
+		}
+		demotedAt := mono.Now()
+		for mono.Since(demotedAt) < lossyHoldDown-heartbeatInterval {
+			ping(pingDiscovery, false)
+			if de.bestAddr.epAddr == direct {
+				t.Fatalf("demoted path re-promoted after %v, hold-down %v", mono.Since(demotedAt), lossyHoldDown)
+			}
+		}
+		time.Sleep(heartbeatInterval)
+		ping(pingDiscovery, false)
+		if de.bestAddr.epAddr != direct {
+			t.Fatal("path not re-promoted after the hold-down")
+		}
+		for i := 0; de.bestAddr.epAddr == direct; i++ {
+			if i == heartbeatHistory {
+				t.Fatal("still lossy path not demoted again")
+			}
+			ping(pingHeartbeat, i%2 == 0)
+		}
+		if got, want := de.endpointState[direct.ap].lossyUntil.Sub(mono.Now()), 2*lossyHoldDown; got != want {
+			t.Fatalf("second hold-down = %v, want %v", got, want)
+		}
+	})
+}
