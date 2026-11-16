@@ -5,6 +5,7 @@ package magicsock
 
 import (
 	"fmt"
+	"math/bits"
 	"net/netip"
 	"testing"
 	"testing/synctest"
@@ -1337,6 +1338,50 @@ func Test_endpoint_lossyDirectPathFallsBackToRelay(t *testing.T) {
 		}
 		if n := de.endpointState[direct.ap].lossyCount; n != 0 {
 			t.Fatalf("lossyCount = %d after a clean window, want 0", n)
+		}
+	})
+}
+
+// A heartbeat times out pingTimeoutDuration after it was sent, usually after the trust
+// from the pong before it ran out: that timeout clears bestAddr, and the loss must still
+// count, or every rediscovery pong puts the lossy path back for good.
+func Test_endpoint_lossyHeartbeatCountsAfterTrustExpires(t *testing.T) {
+	direct := epAddr{ap: netip.MustParseAddrPort("192.0.2.1:7")}
+	synctest.Test(t, func(t *testing.T) {
+		c := &Conn{logf: func(string, ...any) {}, peerMap: newPeerMap()}
+		c.discoAtomic.Set(key.NewDisco())
+		de := &endpoint{
+			c:             c,
+			sentPing:      make(map[stun.TxID]sentPing),
+			endpointState: map[netip.AddrPort]*endpointState{direct.ap: {}},
+			debugUpdates:  ringlog.New[EndpointChange](10),
+		}
+		di := &discoInfo{discoKey: key.NewDisco().Public(), discoShort: "test"}
+		sent := func(purpose discoPingPurpose) stun.TxID {
+			txid := stun.NewTxID()
+			timer := time.NewTimer(time.Hour)
+			timer.Stop()
+			de.sentPing[txid] = sentPing{to: direct, at: mono.Now().Add(-10 * time.Millisecond), timer: timer, purpose: purpose}
+			return txid
+		}
+		pong := func(purpose discoPingPurpose) {
+			de.handlePongConnLocked(&disco.Pong{TxID: sent(purpose), Src: direct.ap}, di, direct)
+		}
+		for i := range 4 { // every other heartbeat lost, each timing out after the trust ran out
+			pong(pingDiscovery) // send() rediscovers the path while bestAddr is unset
+			if i > 0 && de.bestAddr.epAddr != direct {
+				break
+			}
+			pong(pingHeartbeat)
+			txid := sent(pingHeartbeat)
+			time.Sleep(trustUDPAddrDuration + time.Millisecond)
+			de.discoPingTimeout(txid)
+		}
+		if de.bestAddr.epAddr == direct {
+			t.Fatal("path losing every other heartbeat is still bestAddr")
+		}
+		if st := de.endpointState[direct.ap]; st.lossyUntil.IsZero() {
+			t.Fatalf("no hold-down after %d lost heartbeats", bits.OnesCount16(st.heartbeatLost))
 		}
 	})
 }
