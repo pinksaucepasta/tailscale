@@ -2325,7 +2325,11 @@ func (de *endpoint) populatePeerStatus(ps *ipnstate.PeerStatus) {
 	ps.LastWrite = de.lastSendExt.WallTime()
 	ps.Active = now.Sub(de.lastSendExt) < sessionActiveTimeout
 
-	if udpAddr, derpAddr, _ := de.addrForSendLocked(now); udpAddr.ap.IsValid() && !derpAddr.IsValid() {
+	// A best address whose trust expired is still the one sent to, alongside DERP; when the peer has no DERP address to
+	// pair it with (derpAddr invalid), addrForSendLocked returns it alone, which is not a proof that it carries traffic.
+	// Report a direct path only while its trust window is open, so a path that went silent is not shown direct for as long
+	// as nothing else claims the peer (Paperboat: pb status said "Path: direct" for 30-42 s into a cut).
+	if udpAddr, derpAddr, _ := de.addrForSendLocked(now); udpAddr.ap.IsValid() && !derpAddr.IsValid() && (de.isWireguardOnly || !now.After(de.trustBestAddrUntil)) {
 		if udpAddr.vni.IsSet() {
 			ps.PeerRelay = udpAddr.String()
 		} else {
