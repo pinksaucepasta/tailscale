@@ -183,6 +183,33 @@ type DERPRegion struct {
 	Nodes []*DERPNode
 }
 
+// CanServeDERP reports whether this DERP region can serve as a DERP home.
+// Regions that have no DERP servers can never be DERP homes.
+func (r *DERPRegion) CanServeDERP() bool {
+	if r == nil {
+		return false
+	}
+	for _, n := range r.Nodes {
+		if !n.STUNOnly {
+			return true
+		}
+	}
+	return false
+}
+
+// CanServeDERP is [DERPRegion.CanServeDERP] for [DERPRegionView].
+func (v DERPRegionView) CanServeDERP() bool {
+	if !v.Valid() {
+		return false
+	}
+	for _, n := range v.Nodes().All() {
+		if !n.STUNOnly() {
+			return true
+		}
+	}
+	return false
+}
+
 // DERPNode describes a DERP packet relay node running within a DERPRegion.
 type DERPNode struct {
 	// Name is a unique node name (across all regions).
@@ -274,23 +301,4 @@ type DERPAdmitClientResponse struct {
 	Allow bool // whether to permit client
 
 	// TODO(bradfitz,maisem): bandwidth limits, etc?
-}
-
-// HasDERP reports whether the region contains a DERP-capable node.
-// STUN-only and empty regions can provide no relay home.
-func (r *DERPRegion) HasDERP() bool {
-	return r.View().HasDERP()
-}
-
-// HasDERP reports whether the region contains a DERP-capable node.
-func (r DERPRegionView) HasDERP() bool {
-	if !r.Valid() {
-		return false
-	}
-	for _, n := range r.Nodes().All() {
-		if n.Valid() && !n.STUNOnly() {
-			return true
-		}
-	}
-	return false
 }

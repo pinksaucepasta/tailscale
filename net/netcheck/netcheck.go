@@ -1004,7 +1004,7 @@ func (c *Client) GetReport(ctx context.Context, dm *tailcfg.DERPMap, opts *GetRe
 		var wg sync.WaitGroup
 		var need []*tailcfg.DERPRegion
 		for rid, reg := range dm.Regions {
-			if !rs.haveRegionLatency(tailcfg.DERPRegionID(rid)) && regionHasDERPNode(reg) && !reg.Avoid && !reg.NoMeasureNoHome {
+			if !rs.haveRegionLatency(tailcfg.DERPRegionID(rid)) && reg.CanServeDERP() && !reg.Avoid && !reg.NoMeasureNoHome {
 				need = append(need, reg)
 			}
 		}
@@ -1432,12 +1432,6 @@ func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report,
 		prevDERP = c.last.PreferredDERP
 	}
 
-	canRelay := func(id tailcfg.DERPRegionID) bool { return dm.Regions().Get(id).HasDERP() }
-	if !canRelay(prevDERP) {
-		prevDERP = 0
-	}
-	r.PreferredDERP = 0
-
 	// Add report to history, enforce retention window, then take the best (lowest)
 	// latency seen per region across what remains.
 	c.addReportAndPruneExpired(now, r)
@@ -1462,15 +1456,20 @@ func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report,
 		oldRegionCurLatency time.Duration // latency of old PreferredDERP
 	)
 	for regionID, d := range r.RegionLatency {
-		if !canRelay(regionID) {
-			continue
-		}
 		// Scale this report's latency by any scores provided by the
 		// server; we did this for the bestRecent map above, but we
 		// don't mutate the actual reports in-place (in case scores
 		// change), so we need to do it here as well.
 		if score := scores.Get(regionID); score > 0 {
 			d = time.Duration(float64(d) * score)
+		}
+
+		// A STUN-only region has no DERP server to relay through, so it must
+		// never become the preferred DERP even though its STUN probe gives it
+		// a RegionLatency entry. Regions missing from the map or without any
+		// DERP server are equally unable to serve as a home.
+		if !dm.Regions().Get(regionID).CanServeDERP() {
+			continue
 		}
 
 		if regionID == prevDERP {
@@ -1519,7 +1518,7 @@ func (c *Client) addReportHistoryAndSetPreferredDERP(rs *reportState, r *Report,
 		// which undoes any region change we made above.
 		r.PreferredDERP = prevDERP
 	}
-	if canRelay(c.ForcePreferredDERP) {
+	if c.ForcePreferredDERP != 0 {
 		// If the forced DERP region probed successfully, or has recent traffic,
 		// use it.
 		_, haveLatencySample := r.RegionLatency[c.ForcePreferredDERP]
@@ -1761,8 +1760,6 @@ func (c *Client) nodeAddrPort(ctx context.Context, n *tailcfg.DERPNode, port int
 	}
 	return zero, false
 }
-
-func regionHasDERPNode(r *tailcfg.DERPRegion) bool { return r.HasDERP() }
 
 func maxDurationValue(m map[tailcfg.DERPRegionID]time.Duration) (max time.Duration) {
 	for _, v := range m {

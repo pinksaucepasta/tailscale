@@ -150,7 +150,7 @@ func (c *Conn) pickDERPFallback() tailcfg.DERPRegionID {
 		return 0
 	}
 	ids := c.derpMap.RegionIDs()
-	ids = slices.DeleteFunc(ids, func(id tailcfg.DERPRegionID) bool { return !c.derpMap.Regions[id].HasDERP() })
+	ids = slices.DeleteFunc(ids, func(id tailcfg.DERPRegionID) bool { return !c.derpMap.Regions[id].CanServeDERP() })
 	if len(ids) == 0 {
 		// No DERP regions in non-nil map.
 		return 0
@@ -167,7 +167,7 @@ func (c *Conn) pickDERPFallback() tailcfg.DERPRegionID {
 	// We used to do the above for legacy clients, but never updated
 	// it for disco.
 
-	if c.derpMap.Regions[c.myDerp].HasDERP() {
+	if c.derpMap.Regions[c.myDerp].CanServeDERP() {
 		return c.myDerp
 	}
 
@@ -214,9 +214,9 @@ func (c *Conn) maybeSetNearestDERP(report *netcheck.Report, force bool) (preferr
 	}
 	c.mu.Lock()
 	myDerp := c.myDerp
-	currentCanRelay := c.derpMap != nil && c.derpMap.Regions[myDerp].HasDERP()
+	currentCanRelay := c.derpMap != nil && c.derpMap.Regions[myDerp].CanServeDERP()
 	preferredDERP = report.PreferredDERP
-	if c.derpMap == nil || !c.derpMap.Regions[preferredDERP].HasDERP() {
+	if c.derpMap == nil || !c.derpMap.Regions[preferredDERP].CanServeDERP() {
 		preferredDERP = 0
 	}
 	c.mu.Unlock()
@@ -287,7 +287,7 @@ func (c *Conn) setHomeDERPGaugeLocked(derpNum tailcfg.DERPRegionID) {
 func (c *Conn) setNearestDERP(derpNum tailcfg.DERPRegionID) (wantDERP bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.wantDerpLocked() || !c.derpMap.Regions[derpNum].HasDERP() {
+	if !c.wantDerpLocked() || !c.derpMap.Regions[derpNum].CanServeDERP() {
 		c.myDerp = 0
 		c.setHomeDERPGaugeLocked(0)
 		c.health.SetMagicSockDERPHome(0, c.homeless)
