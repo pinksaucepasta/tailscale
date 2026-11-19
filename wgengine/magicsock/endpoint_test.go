@@ -12,6 +12,7 @@ import (
 
 	"tailscale.com/disco"
 	"tailscale.com/envknob"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/packet"
 	"tailscale.com/net/stun"
 	"tailscale.com/tailcfg"
@@ -1475,4 +1476,27 @@ func Test_endpoint_heartbeatSendFailureIsNotLoss(t *testing.T) {
 			t.Fatal("a heartbeat timeout on probation did not demote the path")
 		}
 	})
+}
+
+// A best address whose trust expired must not be reported as the current direct path when the peer has no DERP address
+// to send beside it (a peer homed on a relay the engine cannot name): the status said "direct" for 30-42 s into a cut.
+func Test_endpoint_populatePeerStatusReportsDirectOnlyWhileTrusted(t *testing.T) {
+	now := mono.Now()
+	best := netip.MustParseAddrPort("192.0.2.10:41641")
+	de := &endpoint{c: &Conn{}, lastSendExt: now}
+	de.bestAddr = addrQuality{epAddr: epAddr{ap: best}}
+
+	de.trustBestAddrUntil = now.Add(time.Second)
+	var trusted ipnstate.PeerStatus
+	de.populatePeerStatus(&trusted)
+	if trusted.CurAddr != best.String() {
+		t.Fatalf("trusted best address: CurAddr = %q, want %q", trusted.CurAddr, best)
+	}
+
+	de.trustBestAddrUntil = now.Add(-time.Second)
+	var expired ipnstate.PeerStatus
+	de.populatePeerStatus(&expired)
+	if expired.CurAddr != "" {
+		t.Fatalf("expired best address: CurAddr = %q, want none", expired.CurAddr)
+	}
 }
