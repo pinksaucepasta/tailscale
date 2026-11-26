@@ -49,6 +49,7 @@ type DERPCarrier interface {
 	SendPong([8]byte) error
 	LocalAddr() (netip.AddrPort, error)
 	Ping(context.Context) error
+	Connected() bool
 }
 
 // DERPControlSender separates reliable discovery/bootstrap from packet datagrams.
@@ -849,6 +850,8 @@ func (c *Conn) recordDERPTerminalError(regionID tailcfg.DERPRegionID, carrier DE
 }
 
 // PrepareDERP connects and pings the carrier owned by this Conn for regionID.
+// A carrier that is still connected is used as is, like upstream's sends over a
+// live DERP connection: a read error clears Connected, so a dead one is redialed.
 func (c *Conn) PrepareDERP(ctx context.Context, regionID tailcfg.DERPRegionID) error {
 	if c.derpWriteChanForRegion(regionID, key.NodePublic{}) == nil {
 		return fmt.Errorf("magicsock: DERP region %d is unavailable", regionID)
@@ -861,6 +864,9 @@ func (c *Conn) PrepareDERP(ctx context.Context, regionID tailcfg.DERPRegionID) e
 	}
 	if ad.terminalErr != nil {
 		return fmt.Errorf("magicsock: DERP region %d authority: %w", regionID, ad.terminalErr)
+	}
+	if ad.c.Connected() {
+		return nil
 	}
 	if err := ad.c.Connect(ctx); err != nil {
 		return fmt.Errorf("magicsock: connect DERP region %d: %w", regionID, err)

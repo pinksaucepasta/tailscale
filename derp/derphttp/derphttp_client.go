@@ -208,6 +208,14 @@ func (c *Client) newContext() context.Context {
 	return context.Background()
 }
 
+// Connected reports whether c holds a live server connection: false before the
+// first connect, after Close, and from the moment a read or write error drops it.
+func (c *Client) Connected() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.closed && c.client != nil
+}
+
 // TLSConnectionState returns the last TLS connection state, if any.
 // The client must already be connected.
 func (c *Client) TLSConnectionState() (_ *tls.ConnectionState, ok bool) {

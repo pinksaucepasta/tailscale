@@ -1109,6 +1109,30 @@ var (
 	errPingTooBig  = errors.New("ping size too big")
 )
 
+// maxCandidateSends bounds sendToCandidates per packet batch.
+const maxCandidateSends = 8
+
+// sendToCandidates sends to the peer's own advertised endpoints while no path is
+// trusted and no DERP route exists (a relay-less peer before its first pong).
+// Without it a handshake response is dropped and wireguard-go waits
+// RekeyTimeout (5 s) for the initiator to retry. It reports whether any send
+// was attempted.
+func (de *endpoint) sendToCandidates(buffs [][]byte, offset int) bool {
+	de.mu.Lock()
+	addrs := make([]netip.AddrPort, 0, min(len(de.endpointState), maxCandidateSends))
+	for ap := range de.endpointState {
+		if len(addrs) == maxCandidateSends {
+			break
+		}
+		addrs = append(addrs, ap)
+	}
+	de.mu.Unlock()
+	for _, ap := range addrs {
+		de.c.sendUDPBatch(epAddr{ap: ap}, buffs, offset)
+	}
+	return len(addrs) > 0
+}
+
 func (de *endpoint) send(buffs [][]byte, offset int) error {
 	de.mu.Lock()
 	if de.expired {
@@ -1142,6 +1166,8 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		// DERP they used to contact us.
 		if rid := de.c.fallbackDERPRegionForPeer(de.publicKey); rid != 0 {
 			derpAddr = netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(rid))
+		} else if hasUDPTransport && de.sendToCandidates(buffs, offset) {
+			return nil
 		} else {
 			return errNoUDPOrDERP
 		}
