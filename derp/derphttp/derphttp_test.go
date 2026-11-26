@@ -778,7 +778,7 @@ func TestConnectedTracksLiveConn(t *testing.T) {
 	recvErr := make(chan error, 1)
 	go func() {
 		for {
-			if _, err := c.RecvDetail(); err != nil {
+			if _, _, err := c.RecvDetail(); err != nil {
 				recvErr <- err
 				return
 			}
