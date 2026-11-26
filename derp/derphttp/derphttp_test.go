@@ -745,3 +745,52 @@ func TestConnectThroughProxyHonorsDERPPort(t *testing.T) {
 		t.Errorf("proxy CONNECT target = %q, want %q", got, want)
 	}
 }
+
+// Connected is what PrepareDERP trusts instead of a ping, so it must drop the
+// moment the server side goes away, not only on Close.
+func TestConnectedTracksLiveConn(t *testing.T) {
+	s := derpserver.New(key.NewNode(), t.Logf)
+	httpsrv := &http.Server{
+		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
+		Handler:      derpserver.Handler(s),
+	}
+	ln, err := net.Listen("tcp4", "localhost:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go httpsrv.Serve(ln)
+	defer httpsrv.Close()
+
+	c, err := derphttp.NewClient(key.NewNode(), "http://"+ln.Addr().String(), t.Logf, netmon.NewStatic())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if c.Connected() {
+		t.Fatal("Connected before Connect")
+	}
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Connected() {
+		t.Fatal("not Connected after Connect")
+	}
+	recvErr := make(chan error, 1)
+	go func() {
+		for {
+			if _, err := c.RecvDetail(); err != nil {
+				recvErr <- err
+				return
+			}
+		}
+	}()
+	s.Close() // the server drops every client connection
+	select {
+	case <-recvErr:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no read error after the server closed")
+	}
+	if c.Connected() {
+		t.Fatal("still Connected after a read error")
+	}
+}
