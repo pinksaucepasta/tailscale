@@ -933,8 +933,11 @@ func (c *Conn) updateEndpoints(why string) {
 	if hasUDPTransport && c.noV4Send.Load() && !c.onlyTCP443.Load() && !hostinfo.IsInVM86() {
 		c.mu.Lock()
 		closed := c.closed
+		// A DERP map with no region gets a netcheck that sends no probe, so noV4Send
+		// is no send error; rebinding would reset every peer path on each update.
+		probed := c.derpMap != nil && len(c.derpMap.Regions) > 0
 		c.mu.Unlock()
-		if !closed {
+		if !closed && probed {
 			c.logf("magicsock: last netcheck reported send error. Rebinding.")
 			c.Rebind()
 		}
