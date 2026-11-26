@@ -849,9 +849,18 @@ func (c *Conn) recordDERPTerminalError(regionID tailcfg.DERPRegionID, carrier DE
 	}
 }
 
+// DERPConnected reports whether this Conn's carrier for regionID holds a live
+// connection with no terminal error, so a send can go straight to it as
+// upstream sends over a live DERP connection. It does not prove the relay
+// answers: health probes use PrepareDERP.
+func (c *Conn) DERPConnected(regionID tailcfg.DERPRegionID) bool {
+	c.mu.Lock()
+	ad, ok := c.activeDerp[regionID]
+	c.mu.Unlock()
+	return ok && ad.terminalErr == nil && ad.c.Connected()
+}
+
 // PrepareDERP connects and pings the carrier owned by this Conn for regionID.
-// A carrier that is still connected is used as is, like upstream's sends over a
-// live DERP connection: a read error clears Connected, so a dead one is redialed.
 func (c *Conn) PrepareDERP(ctx context.Context, regionID tailcfg.DERPRegionID) error {
 	if c.derpWriteChanForRegion(regionID, key.NodePublic{}) == nil {
 		return fmt.Errorf("magicsock: DERP region %d is unavailable", regionID)
@@ -864,9 +873,6 @@ func (c *Conn) PrepareDERP(ctx context.Context, regionID tailcfg.DERPRegionID) e
 	}
 	if ad.terminalErr != nil {
 		return fmt.Errorf("magicsock: DERP region %d authority: %w", regionID, ad.terminalErr)
-	}
-	if ad.c.Connected() {
-		return nil
 	}
 	if err := ad.c.Connect(ctx); err != nil {
 		return fmt.Errorf("magicsock: connect DERP region %d: %w", regionID, err)
