@@ -1869,6 +1869,12 @@ func looksLikeInitiationMsg(b []byte) bool {
 		binary.LittleEndian.Uint32(b) == device.MessageInitiationType
 }
 
+// isHandshakeMsg reports whether b is a WireGuard handshake initiation or response.
+func isHandshakeMsg(b []byte) bool {
+	return len(b) == device.MessageInitiationSize && binary.LittleEndian.Uint32(b) == device.MessageInitiationType ||
+		len(b) == device.MessageResponseSize && binary.LittleEndian.Uint32(b) == device.MessageResponseType
+}
+
 // receiveIP is the shared bits of ReceiveIPv4 and ReceiveIPv6.
 //
 // rp.Size & rp.Offset are pre-populated by callers. receiveIP must keep them

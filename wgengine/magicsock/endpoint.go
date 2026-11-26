@@ -1112,12 +1112,15 @@ var (
 // maxCandidateSends bounds sendToCandidates per packet batch.
 const maxCandidateSends = 8
 
-// sendToCandidates sends to the peer's own advertised endpoints while no path is
-// trusted and no DERP route exists (a relay-less peer before its first pong).
-// Without it a handshake response is dropped and wireguard-go waits
-// RekeyTimeout (5 s) for the initiator to retry. It reports whether any send
-// was attempted.
+// sendToCandidates sends a WireGuard handshake message to the peer's own
+// advertised endpoints while no path is trusted and no DERP route exists (a
+// relay-less peer before its first pong). Without it a handshake response is
+// dropped and wireguard-go waits RekeyTimeout (5 s) for the initiator to retry.
+// Data packets are not fanned out. It reports whether any send was attempted.
 func (de *endpoint) sendToCandidates(buffs [][]byte, offset int) bool {
+	if debugNeverDirectUDP() || debugAlwaysDERP() || len(buffs) != 1 || !isHandshakeMsg(buffs[0][offset:]) {
+		return false
+	}
 	de.mu.Lock()
 	addrs := make([]netip.AddrPort, 0, min(len(de.endpointState), maxCandidateSends))
 	for ap := range de.endpointState {

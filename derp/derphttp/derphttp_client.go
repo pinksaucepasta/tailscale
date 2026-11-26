@@ -1024,7 +1024,11 @@ func (c *Client) SendPing(data [8]byte) error {
 	if client == nil {
 		return errors.New("client not connected")
 	}
-	return client.SendPing(data)
+	err := client.SendPing(data)
+	if err != nil {
+		c.closeForReconnect(client) // Connected must not outlive a write failure
+	}
+	return err
 }
 
 // LocalAddr reports c's local TCP address, without any implicit
@@ -1074,7 +1078,11 @@ func (c *Client) SendPong(data [8]byte) error {
 	dc := c.client
 	c.mu.Unlock()
 
-	return dc.SendPong(data)
+	err := dc.SendPong(data)
+	if err != nil {
+		c.closeForReconnect(dc)
+	}
+	return err
 }
 
 // SetCanAckPings sets whether this client will reply to ping requests from the server.
